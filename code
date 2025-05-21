@@ -1,0 +1,209 @@
+import json
+import pandas as pd
+import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_regression, mutual_info_classif
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.metrics import mean_squared_error, r2_score, accuracy_score, f1_score
+from sklearn.base import BaseEstimator, TransformerMixin
+
+# Custom transformer to do correlation based feature selection for regression
+class CorrFeatureSelector(BaseEstimator, TransformerMixin):
+    def __init__(self, target_series, threshold=0.1):
+        self.target = target_series
+        self.threshold = threshold
+        self.selected_features = None
+
+    def fit(self, X, y=None):
+        corrs = []
+        for col in X.columns:
+            corr = np.abs(np.corrcoef(X[col], self.target)[0, 1])
+            corrs.append(corr)
+        self.selected_features = X.columns[np.array(corrs) > self.threshold]
+        return self
+
+    def transform(self, X):
+        return X[self.selected_features]
+
+def parse_json_and_run_pipeline(json_file, csv_file):
+    # Step 1: Load JSON params
+    with open(json_file, 'r') as f:
+        params = json.load(f)
+
+    # Step 2: Load data
+    df = pd.read_csv(csv_file)
+
+    target_col = params['target']
+    prediction_type = params['prediction_type']  # 'regression' or 'classification'
+    
+    X = df.drop(columns=[target_col])
+    y = df[target_col]
+
+    # Step 3: Handle features and missing imputations
+    feature_params = params['features']  # dict of feature col names and imputation methods
+    features = []
+    imputers = []
+    for feature in feature_params:
+        col = feature['column_name']
+        imp_method = feature.get('imputation', 'none').lower()
+        if imp_method == 'mean':
+            imputer = SimpleImputer(strategy='mean')
+        elif imp_method == 'median':
+            imputer = SimpleImputer(strategy='median')
+        elif imp_method == 'most_frequent':
+            imputer = SimpleImputer(strategy='most_frequent')
+        elif imp_method == 'constant':
+            fill_value = feature.get('fill_value', 0)
+            imputer = SimpleImputer(strategy='constant', fill_value=fill_value)
+        else:
+            imputer = 'passthrough'  # No imputation
+        
+        features.append(col)
+        imputers.append(imputer)
+
+    # Build ColumnTransformer for imputations
+    transformers = []
+    for col, imputer in zip(features, imputers):
+        transformers.append((f'impute_{col}', imputer, [col]))
+    feature_imputer = ColumnTransformer(transformers=transformers, remainder='drop')
+
+    # Step 4: Feature reduction
+    reduction_method = params.get('feature_reduction', {}).get('method', 'No Reduction').lower()
+
+    # Define a placeholder transformer for feature reduction
+    feature_reduction_transformer = 'passthrough'
+
+    if reduction_method == 'no reduction':
+        feature_reduction_transformer = 'passthrough'
+
+    elif reduction_method == 'corr with target':
+        # Use custom transformer for correlation-based feature selection
+        threshold = params.get('feature_reduction', {}).get('threshold', 0.1)
+        # We'll apply correlation on numeric columns only
+        def corr_selector(X, y=y, threshold=threshold):
+            # To be wrapped as a transformer below
+            corr_sel = CorrFeatureSelector(target_series=y, threshold=threshold)
+            corr_sel.fit(X)
+            return corr_sel
+
+        # Use a lambda transformer to call the corr selector
+        feature_reduction_transformer = CorrFeatureSelector(target_series=y, threshold=threshold)
+
+    elif reduction_method == 'tree-based':
+        # Use feature importance from a tree model to select features
+        n_features = params.get('feature_reduction', {}).get('n_features', 5)
+
+        class TreeFeatureSelector(BaseEstimator, TransformerMixin):
+            def __init__(self, n_features=n_features, prediction_type=prediction_type):
+                self.n_features = n_features
+                self.prediction_type = prediction_type
+                self.model = None
+                self.selected_features = None
+
+            def fit(self, X, y):
+                if self.prediction_type == 'regression':
+                    self.model = RandomForestRegressor(n_estimators=50, random_state=42)
+                else:
+                    self.model = RandomForestClassifier(n_estimators=50, random_state=42)
+                self.model.fit(X, y)
+                importances = self.model.feature_importances_
+                indices = np.argsort(importances)[::-1][:self.n_features]
+                self.selected_features = X.columns[indices]
+                return self
+
+            def transform(self, X):
+                return X[self.selected_features]
+
+        feature_reduction_transformer = TreeFeatureSelector(n_features=n_features, prediction_type=prediction_type)
+
+    elif reduction_method == 'pca':
+        n_components = params.get('feature_reduction', {}).get('n_components', 5)
+        feature_reduction_transformer = PCA(n_components=n_components)
+
+    else:
+        raise ValueError(f"Unknown feature reduction method: {reduction_method}")
+
+    # Step 5: Model building
+    # Parse models list and select those marked is_selected = true
+    models_to_run = []
+    for model_info in params['models']:
+        if model_info.get('is_selected', False):
+            models_to_run.append(model_info)
+
+    # Supported models mapping: key -> sklearn model class
+    # Make sure model type matches prediction_type
+    MODEL_MAP = {
+        'regression': {
+            'linear_regression': LinearRegression,
+            'random_forest': RandomForestRegressor,
+        },
+        'classification': {
+            'logistic_regression': LogisticRegression,
+            'random_forest': RandomForestClassifier,
+        }
+    }
+
+    # For metrics logging
+    def log_metrics(y_true, y_pred, prediction_type):
+        if prediction_type == 'regression':
+            print("MSE:", mean_squared_error(y_true, y_pred))
+            print("R2:", r2_score(y_true, y_pred))
+        else:
+            print("Accuracy:", accuracy_score(y_true, y_pred))
+            print("F1 Score:", f1_score(y_true, y_pred, average='weighted'))
+
+    # Split data for testing
+    X_train, X_test, y_train, y_test = train_test_split(X[features], y, test_size=0.2, random_state=42)
+
+    for model_info in models_to_run:
+        model_name = model_info['name']
+        print(f"\nRunning model: {model_name}")
+
+        # Instantiate model with default params, then GridSearchCV will override
+        model_class = MODEL_MAP[prediction_type].get(model_name.lower())
+        if model_class is None:
+            print(f"Skipping model {model_name} as not supported for {prediction_type}")
+            continue
+
+        model = model_class()
+
+        # Hyperparams for grid search from JSON
+        param_grid = model_info.get('hyper_params', {})
+
+        # Build pipeline: imputation -> feature reduction -> model
+        pipe = Pipeline([
+            ('imputer', feature_imputer),
+            ('feature_reduction', feature_reduction_transformer),
+            ('model', model)
+        ])
+
+        # Because param_grid keys refer to model hyperparams, we must prefix with 'model__'
+        grid_param = {f'model__{k}': v for k, v in param_grid.items()}
+
+        grid_search = GridSearchCV(pipe, grid_param, cv=3, n_jobs=-1)
+
+        # Fit
+        grid_search.fit(X_train, y_train)
+
+        print("Best params:", grid_search.best_params_)
+
+        # Predict
+        y_pred = grid_search.predict(X_test)
+
+        # Log metrics
+        log_metrics(y_test, y_pred, prediction_type)
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) != 3:
+        print("Usage: python ml_pipeline_generic.py <json_file> <csv_file>")
+        sys.exit(1)
+    json_file = sys.argv[1]
+    csv_file = sys.argv[2]
+
+    parse_json_and_run_pipeline(json_file, csv_file)
